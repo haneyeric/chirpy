@@ -7,6 +7,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"sort"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -26,6 +27,7 @@ type apiConfig struct {
 	dbq            *database.Queries
 	platform       string
 	JWT_Secret     string
+	Polka_Key      string
 }
 
 type Chirp struct {
@@ -50,6 +52,7 @@ func main() {
 	dbURL := os.Getenv("DB_URL")
 	platform := os.Getenv("PLATFORM")
 	jwtsecret := os.Getenv("JWT_SECRET")
+	polkakey := os.Getenv("POLKA_KEY")
 	db, err := sql.Open("postgres", dbURL)
 	if err != nil {
 		return
@@ -59,7 +62,7 @@ func main() {
 	const filerootpath = "."
 	mux := http.NewServeMux()
 
-	cfg := apiConfig{fileserverhits: atomic.Int32{}, dbq: dbQueries, platform: platform, JWT_Secret: jwtsecret}
+	cfg := apiConfig{fileserverhits: atomic.Int32{}, dbq: dbQueries, platform: platform, JWT_Secret: jwtsecret, Polka_Key: polkakey}
 
 	mux.Handle("/app/", cfg.middlewareMetricsInc(http.StripPrefix("/app", http.FileServer(http.Dir(filerootpath)))))
 	mux.HandleFunc("GET /api/healthz", healthz)
@@ -73,6 +76,8 @@ func main() {
 	mux.HandleFunc("POST /api/refresh", cfg.refresh)
 	mux.HandleFunc("POST /api/revoke", cfg.revoke)
 	mux.HandleFunc("PUT /api/users", cfg.updateUser)
+	mux.HandleFunc("POST /api/polka/webhooks", cfg.upgradeUser)
+	mux.HandleFunc("DELETE /api/chirps/{chirpID}", cfg.deleteChirp)
 
 	server := &http.Server{
 		Addr:    ":" + port,
@@ -116,11 +121,40 @@ func (cfg *apiConfig) getChirp(w http.ResponseWriter, r *http.Request) {
 }
 
 func (cfg *apiConfig) getChirps(w http.ResponseWriter, r *http.Request) {
-	chirps, err := cfg.dbq.GetChirps(r.Context())
-	if err != nil {
-		w.WriteHeader(400)
-		return
+	var chirps = make([]database.Chirp, 1)
+	s := r.URL.Query().Get("author_id")
+	var err error
+	if len(s) > 0 {
+		id, err := uuid.Parse(s)
+		if err != nil {
+			fmt.Printf("parse uuid s: %s", s)
+			w.WriteHeader(400)
+			return
+		}
+		chirps, err = cfg.dbq.GetChirpsUser(r.Context(), id)
+		if err != nil {
+			return
+		}
+	} else {
+		chirps, err = cfg.dbq.GetChirps(r.Context())
+		if err != nil {
+			w.WriteHeader(400)
+			return
+		}
 	}
+
+	sortDirection := "asc"
+	sortDirectionParam := r.URL.Query().Get("sort")
+	if sortDirectionParam == "desc" {
+		sortDirection = "desc"
+	}
+	sort.Slice(chirps, func(i, j int) bool {
+		if sortDirection == "desc" {
+			return chirps[i].CreatedAt.After(chirps[j].CreatedAt)
+		}
+		return chirps[i].CreatedAt.Before(chirps[j].CreatedAt)
+	})
+
 	body, err := json.Marshal(chirps)
 
 	if err != nil {
@@ -141,6 +175,7 @@ func (cfg *apiConfig) login(w http.ResponseWriter, r *http.Request) {
 		Email        string    `json:"email,omitempty"`
 		Token        string    `json:"token,omitempty"`
 		RefreshToken string    `json:"refresh_token,omitempty"`
+		IsChirpyRed  bool      `json:"is_chirpy_red,omitempty"`
 	}
 
 	decoder := json.NewDecoder(r.Body)
@@ -186,7 +221,7 @@ func (cfg *apiConfig) login(w http.ResponseWriter, r *http.Request) {
 
 	cfg.dbq.CreateRefreshToken(r.Context(), params)
 
-	l := LoginResponse{Id: user.ID, Created_at: user.CreatedAt, Updated_at: user.UpdatedAt, Email: user.Email, Token: token, RefreshToken: refresh}
+	l := LoginResponse{Id: user.ID, Created_at: user.CreatedAt, Updated_at: user.UpdatedAt, Email: user.Email, Token: token, RefreshToken: refresh, IsChirpyRed: user.IsChirpyRed}
 
 	body, err := json.Marshal(l)
 
@@ -304,6 +339,50 @@ func (cfg *apiConfig) updateUser(w http.ResponseWriter, r *http.Request) {
 
 }
 
+func (cfg *apiConfig) upgradeUser(w http.ResponseWriter, r *http.Request) {
+	apikey, err := auth.GetApiKey(r.Header)
+
+	if err != nil || apikey != cfg.Polka_Key {
+		w.WriteHeader(401)
+		return
+	}
+
+	decoder := json.NewDecoder(r.Body)
+
+	type upgradeInput struct {
+		Event string `json:"event,omitempty"`
+		Data  struct {
+			UserID string `json:"user_id,omitempty"`
+		} `json:"data,omitempty"`
+	}
+
+	upgrade := upgradeInput{}
+
+	err = decoder.Decode(&upgrade)
+
+	if err != nil {
+		w.WriteHeader(500)
+		return
+	}
+
+	if upgrade.Event != "user.upgraded" {
+		w.WriteHeader(204)
+		return
+	}
+
+	id, err := uuid.Parse(upgrade.Data.UserID)
+	if err != nil {
+		w.WriteHeader(404)
+		return
+	}
+	_, err = cfg.dbq.UpgradeUser(r.Context(), id)
+	if err != nil {
+		w.WriteHeader(404)
+		return
+	}
+	w.WriteHeader(204)
+}
+
 func (cfg *apiConfig) createUser(w http.ResponseWriter, r *http.Request) {
 	decoder := json.NewDecoder(r.Body)
 
@@ -414,6 +493,44 @@ func (cfg *apiConfig) createChirp(w http.ResponseWriter, r *http.Request) {
 	w.Write(body)
 }
 
+func (cfg *apiConfig) deleteChirp(w http.ResponseWriter, r *http.Request) {
+	token, err := auth.GetBearerToken(r.Header)
+
+	if err != nil {
+		w.WriteHeader(401)
+		return
+	}
+
+	id, err := auth.ValidateJWT(token, cfg.JWT_Secret)
+	if err != nil {
+		w.WriteHeader(401)
+		return
+	}
+
+	cid, err := uuid.Parse(r.PathValue("chirpID"))
+
+	if err != nil {
+		w.WriteHeader(404)
+		return
+	}
+	chrip, err := cfg.dbq.GetChirp(r.Context(), cid)
+	if err != nil {
+		w.WriteHeader(404)
+		return
+	}
+
+	if id != chrip.UserID {
+		w.WriteHeader(403)
+		return
+	}
+
+	err = cfg.dbq.DeleteChirp(r.Context(), cid)
+	if err != nil {
+		w.WriteHeader(500)
+		return
+	}
+	w.WriteHeader(204)
+}
 func (cfg *apiConfig) middlewareMetricsInc(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		cfg.fileserverhits.Add(1)
