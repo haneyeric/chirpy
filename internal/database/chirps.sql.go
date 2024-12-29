@@ -20,7 +20,7 @@ RETURNING id, created_at, updated_at, body, user_id
 `
 
 type CreateChirpParams struct {
-	Body   string        `json:"body"`
+	Body   string    `json:"body"`
 	UserID uuid.UUID `json:"user_id"`
 }
 

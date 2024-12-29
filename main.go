@@ -19,6 +19,8 @@ import (
 	"github.com/haneyeric/chirpy/internal/database"
 )
 
+const EXPIRES = 60 * 60
+
 type apiConfig struct {
 	fileserverhits atomic.Int32
 	dbq            *database.Queries
@@ -40,7 +42,7 @@ type ChirpResponse struct {
 type UserInput struct {
 	Email    string `json:"email"`
 	Password string `json:"password"`
-	Expires  int    `json:"expires_in_seconds"`
+	Expires  int    `json:"uexpires_in_seconds"`
 }
 
 func main() {
@@ -68,6 +70,9 @@ func main() {
 	mux.HandleFunc("POST /admin/reset", cfg.reset)
 	mux.HandleFunc("POST /api/users", cfg.createUser)
 	mux.HandleFunc("POST /api/login", cfg.login)
+	mux.HandleFunc("POST /api/refresh", cfg.refresh)
+	mux.HandleFunc("POST /api/revoke", cfg.revoke)
+	mux.HandleFunc("PUT /api/users", cfg.updateUser)
 
 	server := &http.Server{
 		Addr:    ":" + port,
@@ -130,11 +135,12 @@ func (cfg *apiConfig) getChirps(w http.ResponseWriter, r *http.Request) {
 
 func (cfg *apiConfig) login(w http.ResponseWriter, r *http.Request) {
 	type LoginResponse struct {
-		Id         uuid.UUID `json:"id,omitempty"`
-		Created_at time.Time `json:"created_at,omitempty"`
-		Updated_at time.Time `json:"updated_at,omitempty"`
-		Email      string    `json:"email,omitempty"`
-		Token      string    `json:"token,omitempty"`
+		Id           uuid.UUID `json:"id,omitempty"`
+		Created_at   time.Time `json:"created_at,omitempty"`
+		Updated_at   time.Time `json:"updated_at,omitempty"`
+		Email        string    `json:"email,omitempty"`
+		Token        string    `json:"token,omitempty"`
+		RefreshToken string    `json:"refresh_token,omitempty"`
 	}
 
 	decoder := json.NewDecoder(r.Body)
@@ -163,19 +169,24 @@ func (cfg *apiConfig) login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	expires := userInput.Expires
-	if expires == 0 || expires > 606 {
-		expires = 60 * 60
-	}
-
-	token, err := auth.MakeJWT(user.ID, cfg.JWT_Secret, time.Duration(expires)*time.Second)
+	token, err := auth.MakeJWT(user.ID, cfg.JWT_Secret, time.Duration(EXPIRES)*time.Second)
 	if err != nil {
 		w.WriteHeader(401)
 		w.Write([]byte(fmt.Sprintf("Incorrect email or password token creation: %s", err)))
 		return
 	}
 
-	l := LoginResponse{Id: user.ID, Created_at: user.CreatedAt, Updated_at: user.UpdatedAt, Email: user.Email, Token: token}
+	refresh, err := auth.MakeRefreshToken()
+
+	if err != nil {
+		return
+	}
+
+	params := database.CreateRefreshTokenParams{Token: refresh, UserID: user.ID}
+
+	cfg.dbq.CreateRefreshToken(r.Context(), params)
+
+	l := LoginResponse{Id: user.ID, Created_at: user.CreatedAt, Updated_at: user.UpdatedAt, Email: user.Email, Token: token, RefreshToken: refresh}
 
 	body, err := json.Marshal(l)
 
@@ -188,6 +199,111 @@ func (cfg *apiConfig) login(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(200)
 	w.Write(body)
 }
+
+func (cfg *apiConfig) refresh(w http.ResponseWriter, r *http.Request) {
+	token, err := auth.GetBearerToken(r.Header)
+	if err != nil {
+		w.WriteHeader(401)
+		return
+	}
+	currToken, err := cfg.dbq.GetRefreshToken(r.Context(), token)
+	if err != nil {
+		w.WriteHeader(401)
+		return
+	}
+	if currToken.RevokedAt.Valid || currToken.ExpiresAt.Before(time.Now()) {
+		w.WriteHeader(401)
+		return
+	}
+
+	user := currToken.UserID
+
+	newToken, err := auth.MakeJWT(user, cfg.JWT_Secret, time.Duration(EXPIRES)*time.Second)
+	if err != nil {
+		w.WriteHeader(401)
+		return
+	}
+
+	type refreshResponse struct {
+		Token string `json:"token,omitempty"`
+	}
+
+	body, err := json.Marshal(refreshResponse{Token: newToken})
+	if err != nil {
+		w.WriteHeader(401)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(200)
+	w.Write(body)
+
+}
+func (cfg *apiConfig) revoke(w http.ResponseWriter, r *http.Request) {
+	token, err := auth.GetBearerToken(r.Header)
+	if err != nil {
+		w.WriteHeader(401)
+		return
+	}
+	err = cfg.dbq.RevokeRefreshToken(r.Context(), token)
+	if err != nil {
+		w.WriteHeader(401)
+		return
+	}
+	w.WriteHeader(204)
+
+}
+
+func (cfg *apiConfig) updateUser(w http.ResponseWriter, r *http.Request) {
+	token, err := auth.GetBearerToken(r.Header)
+
+	if err != nil {
+		w.WriteHeader(401)
+		return
+	}
+
+	id, err := auth.ValidateJWT(token, cfg.JWT_Secret)
+	if err != nil {
+		w.WriteHeader(401)
+		return
+	}
+
+	decoder := json.NewDecoder(r.Body)
+
+	userInput := UserInput{}
+
+	err = decoder.Decode(&userInput)
+
+	if err != nil {
+		w.WriteHeader(500)
+		return
+	}
+
+	hashed, err := auth.HashedPassword(userInput.Password)
+	if err != nil {
+		w.WriteHeader(500)
+		return
+	}
+
+	params := database.UpdateUserParams{ID: id, Email: userInput.Email, HashedPassword: hashed}
+	newUser, err := cfg.dbq.UpdateUser(r.Context(), params)
+	if err != nil {
+		w.WriteHeader(500)
+		return
+	}
+	newUser.HashedPassword = ""
+	body, err := json.Marshal(newUser)
+
+	if err != nil {
+		w.WriteHeader(500)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(200)
+	w.Write(body)
+
+}
+
 func (cfg *apiConfig) createUser(w http.ResponseWriter, r *http.Request) {
 	decoder := json.NewDecoder(r.Body)
 
@@ -229,14 +345,12 @@ func (cfg *apiConfig) createChirp(w http.ResponseWriter, r *http.Request) {
 	token, err := auth.GetBearerToken(r.Header)
 
 	if err != nil {
-		fmt.Printf("get bearer: %s", err)
 		w.WriteHeader(401)
 		return
 	}
 
 	id, err := auth.ValidateJWT(token, cfg.JWT_Secret)
 	if err != nil {
-		fmt.Printf("get validate: %s", err)
 		w.WriteHeader(401)
 		return
 	}
@@ -326,6 +440,7 @@ func (cfg *apiConfig) reset(w http.ResponseWriter, r *http.Request) {
 	}
 	cfg.dbq.DeleteUsers(r.Context())
 	cfg.dbq.DeleteChirps(r.Context())
+	cfg.dbq.DeleteRefreshTokens(r.Context())
 	cfg.fileserverhits.Store(0)
 	w.Header().Add("Content-Type", "text/plain; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
