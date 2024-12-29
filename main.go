@@ -9,18 +9,21 @@ import (
 	"os"
 	"strings"
 	"sync/atomic"
+	"time"
 
 	"github.com/google/uuid"
-	"github.com/haneyeric/chirpy/internal/auth"
-	"github.com/haneyeric/chirpy/internal/database"
 	"github.com/joho/godotenv"
 	_ "github.com/lib/pq"
+
+	"github.com/haneyeric/chirpy/internal/auth"
+	"github.com/haneyeric/chirpy/internal/database"
 )
 
 type apiConfig struct {
 	fileserverhits atomic.Int32
 	dbq            *database.Queries
 	platform       string
+	JWT_Secret     string
 }
 
 type Chirp struct {
@@ -37,12 +40,14 @@ type ChirpResponse struct {
 type UserInput struct {
 	Email    string `json:"email"`
 	Password string `json:"password"`
+	Expires  int    `json:"expires_in_seconds"`
 }
 
 func main() {
 	godotenv.Load()
 	dbURL := os.Getenv("DB_URL")
 	platform := os.Getenv("PLATFORM")
+	jwtsecret := os.Getenv("JWT_SECRET")
 	db, err := sql.Open("postgres", dbURL)
 	if err != nil {
 		return
@@ -52,7 +57,7 @@ func main() {
 	const filerootpath = "."
 	mux := http.NewServeMux()
 
-	cfg := apiConfig{fileserverhits: atomic.Int32{}, dbq: dbQueries, platform: platform}
+	cfg := apiConfig{fileserverhits: atomic.Int32{}, dbq: dbQueries, platform: platform, JWT_Secret: jwtsecret}
 
 	mux.Handle("/app/", cfg.middlewareMetricsInc(http.StripPrefix("/app", http.FileServer(http.Dir(filerootpath)))))
 	mux.HandleFunc("GET /api/healthz", healthz)
@@ -76,7 +81,6 @@ func healthz(w http.ResponseWriter, r *http.Request) {
 	w.Header().Add("Content-Type", "text/plain; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte(http.StatusText(http.StatusOK)))
-	return
 }
 
 func (cfg *apiConfig) getChirp(w http.ResponseWriter, r *http.Request) {
@@ -93,6 +97,7 @@ func (cfg *apiConfig) getChirp(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(404)
 		return
 	}
+
 	body, err := json.Marshal(chirp)
 
 	if err != nil {
@@ -103,7 +108,6 @@ func (cfg *apiConfig) getChirp(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(200)
 	w.Write(body)
-	return
 }
 
 func (cfg *apiConfig) getChirps(w http.ResponseWriter, r *http.Request) {
@@ -122,10 +126,17 @@ func (cfg *apiConfig) getChirps(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(200)
 	w.Write(body)
-	return
 }
 
 func (cfg *apiConfig) login(w http.ResponseWriter, r *http.Request) {
+	type LoginResponse struct {
+		Id         uuid.UUID `json:"id,omitempty"`
+		Created_at time.Time `json:"created_at,omitempty"`
+		Updated_at time.Time `json:"updated_at,omitempty"`
+		Email      string    `json:"email,omitempty"`
+		Token      string    `json:"token,omitempty"`
+	}
+
 	decoder := json.NewDecoder(r.Body)
 
 	userInput := UserInput{}
@@ -134,26 +145,39 @@ func (cfg *apiConfig) login(w http.ResponseWriter, r *http.Request) {
 
 	if err != nil {
 		w.WriteHeader(401)
-		w.Write([]byte(fmt.Sprintf("Incorrect email or password decode input")))
+		w.Write([]byte(("Incorrect email or password decode input")))
 		return
 	}
 
 	user, err := cfg.dbq.GetUser(r.Context(), userInput.Email)
 	if err != nil {
 		w.WriteHeader(401)
-		w.Write([]byte(fmt.Sprintf("Incorrect email or password lookup")))
+		w.Write([]byte(("Incorrect email or password lookup")))
 		return
 	}
 	err = auth.CheckPasswordHash(userInput.Password, user.HashedPassword)
 
 	if err != nil {
 		w.WriteHeader(401)
-		w.Write([]byte(fmt.Sprintf("Incorrect email or password pass check")))
+		w.Write([]byte(("Incorrect email or password pass check")))
 		return
 	}
 
-	user.HashedPassword = ""
-	body, err := json.Marshal(user)
+	expires := userInput.Expires
+	if expires == 0 || expires > 606 {
+		expires = 60 * 60
+	}
+
+	token, err := auth.MakeJWT(user.ID, cfg.JWT_Secret, time.Duration(expires)*time.Second)
+	if err != nil {
+		w.WriteHeader(401)
+		w.Write([]byte(fmt.Sprintf("Incorrect email or password token creation: %s", err)))
+		return
+	}
+
+	l := LoginResponse{Id: user.ID, Created_at: user.CreatedAt, Updated_at: user.UpdatedAt, Email: user.Email, Token: token}
+
+	body, err := json.Marshal(l)
 
 	if err != nil {
 		w.WriteHeader(500)
@@ -163,7 +187,6 @@ func (cfg *apiConfig) login(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(200)
 	w.Write(body)
-	return
 }
 func (cfg *apiConfig) createUser(w http.ResponseWriter, r *http.Request) {
 	decoder := json.NewDecoder(r.Body)
@@ -171,9 +194,6 @@ func (cfg *apiConfig) createUser(w http.ResponseWriter, r *http.Request) {
 	userInput := UserInput{}
 
 	err := decoder.Decode(&userInput)
-
-	fmt.Printf("userInput.email: %s\n", userInput.Email)
-	fmt.Printf("userInput.password: %s\n", userInput.Password)
 
 	if err != nil {
 		w.WriteHeader(500)
@@ -186,8 +206,6 @@ func (cfg *apiConfig) createUser(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	fmt.Printf("hashed: %s\n", hashed)
-
 	params := database.CreateUserParams{Email: userInput.Email, HashedPassword: hashed}
 
 	user, err := cfg.dbq.CreateUser(r.Context(), params)
@@ -198,9 +216,6 @@ func (cfg *apiConfig) createUser(w http.ResponseWriter, r *http.Request) {
 	user.HashedPassword = ""
 	body, err := json.Marshal(user)
 
-	fmt.Printf("user.Email: %s\n", user.Email)
-	fmt.Printf("body: %s\n", body)
-
 	if err != nil {
 		w.WriteHeader(500)
 		return
@@ -209,12 +224,26 @@ func (cfg *apiConfig) createUser(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(201)
 	w.Write(body)
-	return
 }
 func (cfg *apiConfig) createChirp(w http.ResponseWriter, r *http.Request) {
+	token, err := auth.GetBearerToken(r.Header)
+
+	if err != nil {
+		fmt.Printf("get bearer: %s", err)
+		w.WriteHeader(401)
+		return
+	}
+
+	id, err := auth.ValidateJWT(token, cfg.JWT_Secret)
+	if err != nil {
+		fmt.Printf("get validate: %s", err)
+		w.WriteHeader(401)
+		return
+	}
+
 	decoder := json.NewDecoder(r.Body)
 	chirp := database.Chirp{}
-	err := decoder.Decode(&chirp)
+	err = decoder.Decode(&chirp)
 
 	if err != nil {
 		w.WriteHeader(500)
@@ -250,10 +279,11 @@ func (cfg *apiConfig) createChirp(w http.ResponseWriter, r *http.Request) {
 	s := ChirpResponse{CleanedBody: strings.Join(words, " ")}
 	chirp.Body = s.CleanedBody
 
-	params := database.CreateChirpParams{Body: chirp.Body, UserID: chirp.UserID}
+	params := database.CreateChirpParams{Body: chirp.Body, UserID: id}
 	chirp, err = cfg.dbq.CreateChirp(r.Context(), params)
 
 	if err != nil {
+		fmt.Printf("Create chirp: %s", err)
 		w.WriteHeader(400)
 		return
 	}
@@ -268,7 +298,6 @@ func (cfg *apiConfig) createChirp(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(201)
 	w.Write(body)
-	return
 }
 
 func (cfg *apiConfig) middlewareMetricsInc(next http.Handler) http.Handler {
@@ -289,7 +318,6 @@ func (cfg *apiConfig) metrics(w http.ResponseWriter, r *http.Request) {
 	  </body>
 	</html>
 	`, cfg.fileserverhits.Load())))
-	return
 }
 func (cfg *apiConfig) reset(w http.ResponseWriter, r *http.Request) {
 	if cfg.platform != "dev" {
@@ -297,9 +325,9 @@ func (cfg *apiConfig) reset(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	cfg.dbq.DeleteUsers(r.Context())
+	cfg.dbq.DeleteChirps(r.Context())
 	cfg.fileserverhits.Store(0)
 	w.Header().Add("Content-Type", "text/plain; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte(fmt.Sprintf("Hits: %d", cfg.fileserverhits.Load())))
-	return
 }
